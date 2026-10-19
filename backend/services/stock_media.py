@@ -18,6 +18,7 @@ tries every configured provider with Pexels first, so an install that only
 has a Pexels key gets exactly the footage it got before.
 """
 import logging
+import time
 from enum import Enum
 from typing import TypedDict
 
@@ -46,6 +47,35 @@ MIN_WIDTH_PORTRAIT = 720
 MIN_HEIGHT_PORTRAIT = 1280
 MIN_WIDTH_LANDSCAPE = 1280
 MIN_HEIGHT_LANDSCAPE = 720
+
+# Pixabay query length limit (longer queries return 400 Bad Request).
+PIXABAY_MAX_QUERY_LENGTH = 100
+
+# Pixabay API terms require caching requests for 24 hours.
+PIXABAY_CACHE_TTL = 24 * 60 * 60  # 86400 seconds
+
+# Score bonus for renditions matching the requested orientation natively.
+NATIVE_ORIENTATION_BONUS = 50.0
+
+# In-process cache: (query, orientation, per_page) -> (timestamp, list[StockClip])
+_pixabay_cache: dict[tuple[str, str, int], tuple[float, list["StockClip"]]] = {}
+
+
+def clear_pixabay_cache() -> None:
+    """Clear the Pixabay in-process response cache."""
+    _pixabay_cache.clear()
+
+
+def _truncate_query(query: str, max_length: int = PIXABAY_MAX_QUERY_LENGTH) -> str:
+    """Trim query to max_length on a word boundary without trailing whitespace."""
+    query = query.strip()
+    if len(query) <= max_length:
+        return query
+    trimmed = query[:max_length]
+    last_space = trimmed.rfind(" ")
+    if last_space > 0:
+        return trimmed[:last_space].rstrip()
+    return trimmed
 
 
 class StockProvider(str, Enum):
@@ -109,9 +139,20 @@ def _score(width: int, height: int, hd: bool) -> float:
     return score
 
 
-def _select(variants: list[StockVariant], orientation: str) -> tuple[StockVariant, float] | None:
-    """Best rendition that clears the resolution bar and matches orientation."""
-    min_w, min_h = _min_dimensions(orientation)
+def _select(
+    variants: list[StockVariant],
+    orientation: str,
+    require_orientation: bool = True,
+) -> tuple[StockVariant, float] | None:
+    """Best rendition that clears the resolution bar and matches orientation.
+
+    When `require_orientation` is True (Pexels), renditions must match the
+    requested orientation exactly and clear both minimum width and height.
+
+    When `require_orientation` is False (Pixabay), only the short side is
+    floored (>= 720) because the video pipeline scales to cover and center-crops,
+    and renditions matching the native orientation receive a score bonus.
+    """
     want_portrait = orientation == "portrait"
 
     best: StockVariant | None = None
@@ -119,11 +160,20 @@ def _select(variants: list[StockVariant], orientation: str) -> tuple[StockVarian
     for variant in variants:
         width = variant.get("width") or 0
         height = variant.get("height") or 0
-        if width < min_w or height < min_h:
-            continue
-        if (height > width) != want_portrait:
-            continue
-        score = _score(width, height, variant.get("hd", False))
+        if require_orientation:
+            min_w, min_h = _min_dimensions(orientation)
+            if width < min_w or height < min_h:
+                continue
+            if (height > width) != want_portrait:
+                continue
+            score = _score(width, height, variant.get("hd", False))
+        else:
+            if min(width, height) < 720:
+                continue
+            score = _score(width, height, variant.get("hd", False))
+            if (height > width) == want_portrait:
+                score += NATIVE_ORIENTATION_BONUS
+
         if best is None or score > best_score:
             best = variant
             best_score = score
@@ -201,14 +251,25 @@ class PixabayProvider:
         if not self.api_key:
             raise VideoGenerationError("Pixabay API key not configured")
 
+        query = _truncate_query(query)
+        clamped_per_page = max(PIXABAY_MIN_PER_PAGE, min(PIXABAY_MAX_PER_PAGE, per_page))
+
+        cache_key = (query, orientation, clamped_per_page)
+        now = time.time()
+        if cache_key in _pixabay_cache:
+            cached_time, cached_clips = _pixabay_cache[cache_key]
+            if now - cached_time < PIXABAY_CACHE_TTL:
+                return [dict(c) for c in cached_clips]
+
         resp = await self._http.get(
             PIXABAY_API,
             params={
                 "key": self.api_key,
                 "q": query,
+                "video_type": "film",
                 # A caller's 1 or 500 would be a 400 from the API, so clamp it
                 # here instead of failing the scene over a paging preference.
-                "per_page": max(PIXABAY_MIN_PER_PAGE, min(PIXABAY_MAX_PER_PAGE, per_page)),
+                "per_page": clamped_per_page,
                 "order": "popular",
                 # ViralMint is a general-audience video tool and Pixabay
                 # defaults this to "false", so say it explicitly.
@@ -239,7 +300,7 @@ class PixabayProvider:
                     # large renditions are HD, small and tiny are not.
                     "hd": max(width, height) >= 1280,
                 })
-            chosen = _select(variants, orientation)
+            chosen = _select(variants, orientation, require_orientation=False)
             if not chosen:
                 continue
             variant, score = chosen
@@ -256,7 +317,8 @@ class PixabayProvider:
             })
 
         clips.sort(key=lambda c: c["quality_score"], reverse=True)
-        return clips
+        _pixabay_cache[cache_key] = (now, clips)
+        return [dict(c) for c in clips]
 
 
 PROVIDER_CLASSES = {
@@ -321,7 +383,8 @@ async def search_clips(
                 _api_key(provider_enum),
             ).search(query, orientation=orientation, per_page=per_page)
         except Exception as e:
-            logger.warning("Stock search via %s failed for %r: %s", provider_enum.value, query, e)
+            err_detail = getattr(getattr(e, "response", None), "status_code", None) or type(e).__name__
+            logger.warning("Stock search via %s failed for %r: %s", provider_enum.value, query, err_detail)
             continue
         if clips:
             return clips

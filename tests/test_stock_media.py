@@ -66,6 +66,13 @@ def keys(monkeypatch):
     return _set
 
 
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    sm.clear_pixabay_cache()
+    yield
+    sm.clear_pixabay_cache()
+
+
 class TestPixabayAdapter:
     async def test_normalizes_a_portrait_hit_into_a_stock_clip(self):
         hit = _hit(7, duration=20, large=_size(1080, 1920, "http://x/large.mp4"))
@@ -81,8 +88,8 @@ class TestPixabayAdapter:
         assert (clip["width"], clip["height"]) == (1080, 1920)
         assert clip["page_url"] == "https://pixabay.com/videos/id-7/"
         assert clip["duration"] == 20
-        # hd(100) + reasonable-size(50) + 1080/100(10.8) + duration 20/5(4)
-        assert clip["quality_score"] == pytest.approx(164.8, abs=0.01)
+        # hd(100) + reasonable-size(50) + 1080/100(10.8) + native_bonus(50) + duration 20/5(4)
+        assert clip["quality_score"] == pytest.approx(214.8, abs=0.01)
 
     async def test_picks_a_landscape_rendition_for_a_landscape_video(self):
         hit = _hit(1, large=_size(1920, 1080, "http://x/hd.mp4"),
@@ -102,14 +109,35 @@ class TestPixabayAdapter:
 
         assert [c["download_url"] for c in clips] == ["http://x/medium.mp4"]
 
-    async def test_skips_clips_that_are_too_small_or_the_wrong_shape(self):
+    async def test_skips_clips_where_short_side_is_below_minimum(self):
         hits = [
-            _hit(1, large=_size(640, 360, "http://x/tiny.mp4")),   # too small
-            _hit(2, large=_size(1920, 1080, "http://x/wide.mp4")),  # wrong shape
+            _hit(1, large=_size(640, 360, "http://x/tiny.mp4")),  # short side 360 < 720
         ]
         provider = sm.PixabayProvider("k", http=_client({"hits": hits}))
 
         assert await provider.search("x", orientation="portrait") == []
+
+    async def test_portrait_search_over_landscape_only_pixabay_hits_returns_clips(self):
+        hit = _hit(1, large=_size(1920, 1080, "http://x/landscape.mp4"))
+        provider = sm.PixabayProvider("k", http=_client({"hits": [hit]}))
+
+        clips = await provider.search("ocean", orientation="portrait")
+
+        assert len(clips) == 1
+        assert clips[0]["download_url"] == "http://x/landscape.mp4"
+        assert (clips[0]["width"], clips[0]["height"]) == (1920, 1080)
+        # hd(100) + reasonable-size(50) + 1920/100(19.2) + duration 12/5(2.4), no native bonus
+        assert clips[0]["quality_score"] == pytest.approx(171.6, abs=0.01)
+
+    async def test_native_orientation_receives_score_bonus(self):
+        portrait_hit = _hit(1, duration=10, large=_size(1080, 1920, "http://x/portrait.mp4"))
+        landscape_hit = _hit(2, duration=10, large=_size(1920, 1080, "http://x/landscape.mp4"))
+        provider = sm.PixabayProvider("k", http=_client({"hits": [portrait_hit, landscape_hit]}))
+
+        clips = await provider.search("ocean", orientation="portrait")
+
+        assert [c["id"] for c in clips] == [1, 2]
+        assert clips[0]["quality_score"] > clips[1]["quality_score"]
 
     async def test_clamps_per_page_into_the_range_the_api_accepts(self):
         hits = []
@@ -127,9 +155,103 @@ class TestPixabayAdapter:
         params = client.get.call_args.kwargs["params"]
         assert params["key"] == "SECRET"
         assert params["q"] == "x"
+        assert params["video_type"] == "film"
         assert params["safesearch"] == "true"
         assert params["order"] == "popular"
         assert client.get.call_args.args[0] == sm.PIXABAY_API
+
+    async def test_truncates_queries_over_100_characters_on_word_boundary(self):
+        client = _client({"hits": []})
+        long_query = (
+            "cinematic aerial landscape of dramatic mountain peaks at sunset with golden hour "
+            "lighting and moody clouds floating"
+        )
+        assert len(long_query) == 115
+
+        await sm.PixabayProvider("k", http=client).search(long_query)
+
+        sent_q = client.get.call_args.kwargs["params"]["q"]
+        assert len(sent_q) <= 100
+        assert sent_q == (
+            "cinematic aerial landscape of dramatic mountain peaks at sunset with golden hour "
+            "lighting and moody"
+        )
+        assert not sent_q.endswith(" ")
+
+    async def test_queries_under_100_characters_are_sent_untouched(self):
+        client = _client({"hits": []})
+        query = "cinematic mountain landscape"
+
+        await sm.PixabayProvider("k", http=client).search(query)
+
+        sent_q = client.get.call_args.kwargs["params"]["q"]
+        assert sent_q == query
+
+    async def test_caches_requests_for_24_hours(self):
+        hit = _hit(1, large=_size(1920, 1080, "http://x/1.mp4"))
+        client = _client({"hits": [hit]})
+        provider = sm.PixabayProvider("k", http=client)
+
+        first = await provider.search("ocean", orientation="portrait", per_page=10)
+        assert client.get.call_count == 1
+
+        second = await provider.search("ocean", orientation="portrait", per_page=10)
+        assert client.get.call_count == 1, "Second request should hit the 24h cache"
+        assert first == second
+
+    async def test_cache_expires_after_ttl(self, monkeypatch):
+        hit = _hit(1, large=_size(1920, 1080, "http://x/1.mp4"))
+        client = _client({"hits": [hit]})
+        provider = sm.PixabayProvider("k", http=client)
+
+        current_time = 1000.0
+        monkeypatch.setattr(sm.time, "time", lambda: current_time)
+
+        await provider.search("ocean", orientation="portrait", per_page=10)
+        assert client.get.call_count == 1
+
+        # Advance within 24h TTL -> hit
+        current_time += sm.PIXABAY_CACHE_TTL - 1
+        await provider.search("ocean", orientation="portrait", per_page=10)
+        assert client.get.call_count == 1
+
+        # Advance past 24h TTL -> miss & refetch
+        current_time += 2
+        await provider.search("ocean", orientation="portrait", per_page=10)
+        assert client.get.call_count == 2
+
+    async def test_cache_separates_keys_by_query_orientation_and_page_size(self):
+        client = _client({"hits": []})
+        provider = sm.PixabayProvider("k", http=client)
+
+        await provider.search("ocean", orientation="portrait", per_page=10)
+        assert client.get.call_count == 1
+
+        # Different orientation -> new request
+        await provider.search("ocean", orientation="landscape", per_page=10)
+        assert client.get.call_count == 2
+
+        # Different per_page -> new request
+        await provider.search("ocean", orientation="portrait", per_page=20)
+        assert client.get.call_count == 3
+
+        # Different query -> new request
+        await provider.search("mountain", orientation="portrait", per_page=10)
+        assert client.get.call_count == 4
+
+    async def test_cache_does_not_cache_failures(self):
+        failing_client = _client(side_effect=httpx.ConnectError("down"))
+        provider = sm.PixabayProvider("k", http=failing_client)
+
+        with pytest.raises(httpx.ConnectError):
+            await provider.search("retry", orientation="portrait")
+
+        succeeding_client = _client({"hits": [_hit(1, large=_size(1920, 1080))]})
+        provider_ok = sm.PixabayProvider("k", http=succeeding_client)
+
+        clips = await provider_ok.search("retry", orientation="portrait")
+        assert len(clips) == 1
+        assert succeeding_client.get.call_count == 1
 
     async def test_requires_a_key_and_does_not_call_the_api(self):
         client = _client({"hits": []})
@@ -252,6 +374,21 @@ class TestSearchAcrossProviders:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(sm, "_http", client)
             assert await sm.search_clips("ocean") == []
+
+    async def test_failing_search_does_not_log_the_api_key(self, keys, caplog):
+        keys(pixabay="SECRET_KEY_12345", provider="pixabay")
+
+        req = httpx.Request("GET", "https://pixabay.com/api/videos/?key=SECRET_KEY_12345&q=test")
+        resp = httpx.Response(400, request=req)
+        err = httpx.HTTPStatusError("400 Bad Request", request=req, response=resp)
+
+        client = _client(side_effect=err)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(sm, "_http", client)
+            assert await sm.search_clips("test") == []
+
+        assert "SECRET_KEY_12345" not in caplog.text
+        assert "Stock search via pixabay failed for 'test': 400" in caplog.text
 
     async def test_a_pinned_provider_never_falls_back(self, keys):
         keys(pexels="p", pixabay="b", provider="pexels")
